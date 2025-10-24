@@ -1,0 +1,349 @@
+main
+
+-- Define variables for dynamic date range filtering
+SET start_date = '2020-01-01';
+SET end_date = DATEADD(DAY, 6, CURRENT_DATE());
+SET lookback_date_7d = DATEADD(DAY, -8, CURRENT_DATE());
+SET lookback_date_60d = DATEADD(MONTH, -2, last_day(CURRENT_DATE()));
+
+-- Use generic database/schema names (replace with actual environment details)
+USE DATABASE PROJECT_ANALYTICS_DB;
+USE SCHEMA FUNNEL_DATA;
+
+-- 2. BASE EVENT DATA EXTRACTION AND INITIAL SESSION FILTERING
+--------------------------------------------------------------------------------
+
+-- Create the base table by pulling all necessary raw events within the date range
+CREATE OR REPLACE TEMPORARY TABLE RawEventData AS
+SELECT
+    CONTEXT_ID AS SessionID,
+    TIMESTAMP AS EventTimestamp,
+    EVENT_TYPE,
+    JSON_DATA,
+    ITEMS_OBJECT,
+    DERIVED_CUSTOMER_ID AS UserIdentifierHash,
+    DERIVED_OS_VERSION,
+    DERIVED_DEVICE_NAME
+FROM
+    RAW_DATA_LAKE.EVENT_LOGS.EVENT_HISTORY
+WHERE
+    CHANNEL = 'Digital_Web'
+    AND DATE(EventTimestamp) BETWEEN $start_date AND $end_date;
+
+-- 3. SESSION CONTEXT & FLOW CLASSIFICATION
+--------------------------------------------------------------------------------
+
+-- Define valid sessions, filter bot traffic, and determine device type
+CREATE OR REPLACE TEMPORARY TABLE SessionContext AS
+SELECT
+    a.SessionID,
+    a.EventTimestamp AS SessionStartTimestamp,
+    a.UserIdentifierHash,
+    -- Determine the primary flow based on entry point
+    COALESCE(ITEMS_OBJECT:entryPoint[0]::STRING, 'StandardFlow') AS FunnelFlowType,
+    JSON_DATA:userAgent::STRING AS UserAgent,
+    JSON_DATA:ipAddress::STRING AS IpAddress,
+
+    -- Classify Device Category
+    CASE
+        WHEN CONTAINS(UserAgent, 'Windows NT') THEN 'Windows'
+        WHEN CONTAINS(UserAgent, 'Macintosh') THEN 'MacOs'
+        WHEN CONTAINS(UserAgent, 'iPad') OR CONTAINS(UserAgent, 'iPhone') THEN 'iOS Mobile'
+        WHEN CONTAINS(UserAgent, 'Android') THEN 'Android Mobile'
+        ELSE 'Other/Bot'
+    END AS DeviceType
+FROM
+    RawEventData a
+LEFT JOIN
+    EXTERNAL_SOURCES.SECURITY.IP_AGGREGATOR b ON (
+        PARSE_IP(a.IpAddress) BETWEEN b.IP_ADDRESS_INTEGER_START_VALUE AND b.IP_ADDRESS_INTEGER_END_VALUE
+    )
+WHERE
+    a.EVENT_TYPE = 'CreateContext'
+    -- Ensure it's a valid session start event
+    AND (a.JSON_DATA:activityType::STRING = 'CreateContext' OR CONTAINS(a.ITEMS_OBJECT:flow[0]::STRING, 'FastTrack'))
+    -- Filter out known bot traffic
+    AND NOT CONTAINS(UserAgent, 'Bot|Crawler|Script')
+    AND b.AGGREGATOR_NAME IS NULL;
+
+-- 4. CUSTOMER PROFILE DEDUPLICATION (LATEST RECORD WINS)
+--------------------------------------------------------------------------------
+
+-- Uses RANK() to capture the single latest profile update event for each session.
+
+-- 4.1. Latest Email Address
+CREATE OR REPLACE TEMPORARY TABLE LatestEmail AS
+SELECT DISTINCT
+    SessionID,
+    JSON_DATA:emailAddress::STRING AS LatestEmailAddress
+FROM (
+    SELECT
+        SessionID,
+        JSON_DATA,
+        -- Rank by timestamp descending (latest update wins)
+        RANK() OVER (
+            PARTITION BY SessionID
+            ORDER BY EventTimestamp DESC, JSON_DATA:createDateTime DESC
+        ) AS TimeRank
+    FROM RawEventData
+    WHERE EVENT_TYPE = 'UpdateCustomerEmailAddress'
+)
+WHERE TimeRank = 1;
+
+-- 4.2. Latest Name Components
+CREATE OR REPLACE TEMPORARY TABLE LatestName AS
+SELECT DISTINCT
+    SessionID,
+    JSON_DATA:firstName::STRING AS FirstName,
+    JSON_DATA:lastName::STRING AS LastName
+FROM (
+    SELECT
+        SessionID,
+        JSON_DATA,
+        RANK() OVER (
+            PARTITION BY SessionID
+            ORDER BY EventTimestamp DESC, JSON_DATA:createDateTime DESC
+        ) AS TimeRank
+    FROM RawEventData
+    WHERE EVENT_TYPE = 'UpdateCustomerName'
+)
+WHERE TimeRank = 1;
+
+-- 4.3. Latest Address Components
+CREATE OR REPLACE TEMPORARY TABLE LatestAddress AS
+SELECT DISTINCT
+    SessionID,
+    JSON_DATA:addressLine1::STRING AS AddressLine1,
+    JSON_DATA:city::STRING AS City,
+    JSON_DATA:stateCode::STRING AS StateCode,
+    JSON_DATA:primaryPostalCode::STRING AS PostalCode
+FROM (
+    SELECT
+        SessionID,
+        JSON_DATA,
+        RANK() OVER (
+            PARTITION BY SessionID
+            ORDER BY EventTimestamp DESC, JSON_DATA:createDateTime DESC
+        ) AS TimeRank
+    FROM RawEventData
+    WHERE EVENT_TYPE = 'UpdateCustomerAddress'
+)
+WHERE TimeRank = 1;
+
+-- 5. PRODUCT INTENT AND STANDARDIZATION
+--------------------------------------------------------------------------------
+
+-- Combines all events that indicate a product selection (CreateContext, CheckPoint, NewApplication)
+CREATE OR REPLACE TEMPORARY TABLE ProductSelectionEvents AS
+SELECT
+    a.SessionID,
+    a.EventTimestamp AS CreatedDateTime,
+    -- Prioritize product code extraction based on event type hierarchy
+    COALESCE(
+        CASE
+            WHEN a.EVENT_TYPE = 'NewApplication' THEN JSON_DATA:requestedProductCode::STRING
+            WHEN a.EVENT_TYPE = 'CheckPoint' THEN JSON_DATA:ProductCode::STRING
+            ELSE ITEMS_OBJECT:selectedProductType[0]::STRING
+        END,
+        'Undefined'
+    ) AS RequestedProductCode,
+
+    -- Extract and map sub-product to a generic, human-readable name
+    CASE JSON_DATA:requestedSubProductCode::STRING
+        WHEN 'CRD01' THEN 'Rewards Credit Card'
+        WHEN 'CRD02' THEN 'Low Interest Credit Card'
+        WHEN 'CHK01' THEN 'Basic Checking Account'
+        WHEN 'CHK02' THEN 'Premium Checking Account'
+        WHEN 'SAV01' THEN 'High Yield Savings'
+        WHEN 'MMA01' THEN 'Relationship Money Market'
+        ELSE 'Undetermined'
+    END AS ProductDisplayName
+FROM
+    RawEventData a
+WHERE
+    a.EVENT_TYPE IN ('CreateContext', 'CheckPoint', 'NewApplication');
+
+-- 6. IDENTIFY FIRST INTENDED PRODUCT
+--------------------------------------------------------------------------------
+
+-- Finds the earliest event and links it to the product selected at that time.
+CREATE OR REPLACE TEMPORARY TABLE InitialProductIntent AS
+SELECT
+    a.SessionID,
+    a.RequestedProductCode AS FinalProductCode,
+    a.ProductDisplayName AS FinalProductName
+FROM
+    ProductSelectionEvents a
+INNER JOIN (
+    SELECT SessionID, MIN(CreatedDateTime) AS Min_Timestamp
+    FROM ProductSelectionEvents
+    GROUP BY SessionID
+) b
+    ON a.SessionID = b.SessionID
+    AND a.CreatedDateTime = b.Min_Timestamp;
+
+
+-- 7. ACCOUNT OPENING AND SEQUENCING
+--------------------------------------------------------------------------------
+
+-- Union successful application starts and confirmed account openings
+CREATE OR REPLACE TEMPORARY TABLE ConsolidatedAccounts AS
+SELECT
+    SessionID,
+    JSON_DATA:applicationId::STRING AS ApplicationID,
+    JSON_DATA:accountPermId::STRING AS AccountID,
+    'Opened' AS EventOutcome
+FROM RawEventData
+WHERE EVENT_TYPE = 'OpenAccount'
+UNION ALL
+SELECT
+    SessionID,
+    JSON_DATA:applicationId::STRING AS ApplicationID,
+    NULL AS AccountID,
+    'Applied' AS EventOutcome
+FROM RawEventData
+WHERE EVENT_TYPE = 'NewApplication';
+
+-- Rank multiple applications/accounts to determine primary and secondary
+CREATE OR REPLACE TEMPORARY TABLE AccountSequenceRanked AS
+SELECT
+    *,
+    RANK() OVER (
+        PARTITION BY SessionID
+        ORDER BY
+            CASE WHEN EventOutcome = 'Opened' THEN 1 ELSE 2 END, -- Prioritize opened accounts
+            ApplicationID ASC
+    ) AS AccountSequence
+FROM
+    ConsolidatedAccounts;
+
+-- Link up to the first two accounts opened/applied for
+CREATE OR REPLACE TEMPORARY TABLE AccountLinkage AS
+SELECT DISTINCT
+    ctx.SessionID,
+    acc1.ApplicationID AS APPLICATION_ID_1,
+    acc1.AccountID AS ACCOUNT_ID_1,
+    acc2.ApplicationID AS APPLICATION_ID_2,
+    acc2.AccountID AS ACCOUNT_ID_2
+FROM
+    SessionContext ctx
+LEFT JOIN AccountSequenceRanked acc1 ON ctx.SessionID = acc1.SessionID AND acc1.AccountSequence = 1
+LEFT JOIN AccountSequenceRanked acc2 ON ctx.SessionID = acc2.SessionID AND acc2.AccountSequence = 2;
+
+
+-- 8. CUSTOMER PATH AND KYC STATUS TRACKING
+--------------------------------------------------------------------------------
+
+-- Determine if the user is New or Existing based on key events
+
+-- 8.1. New Customer Flag
+CREATE OR REPLACE TEMPORARY TABLE NewCustomerFlag AS
+SELECT DISTINCT SessionID, 'New Customer' AS Path
+FROM RawEventData
+WHERE EVENT_TYPE = 'NewCustomer';
+
+-- 8.2. Existing/Authenticated Customer Flags
+CREATE OR REPLACE TEMPORARY TABLE ExistingCustomerFlags AS
+SELECT DISTINCT
+    SessionID,
+    'Existing Customer' AS Path
+FROM RawEventData
+WHERE
+    EVENT_TYPE IN ('CheckPoint', 'LastField')
+    AND (
+        JSON_DATA:isExistingCustomer::BOOLEAN = TRUE OR
+        CONTAINS(JSON_DATA:flowStep::STRING, 'ExistingCustomerAuth')
+    );
+
+-- 8.3. Aggregated Customer Path
+CREATE OR REPLACE TEMPORARY TABLE CustomerPathAggregated AS
+SELECT
+    COALESCE(e.SessionID, n.SessionID) AS SessionID,
+    CASE
+        WHEN e.SessionID IS NOT NULL AND n.SessionID IS NOT NULL THEN 'Existing Customer (New Product Add)'
+        WHEN n.SessionID IS NOT NULL THEN 'New Customer'
+        WHEN e.SessionID IS NOT NULL THEN 'Existing Customer'
+        ELSE 'Unknown/Guest'
+    END AS CustomerPathClassification
+FROM
+    ExistingCustomerFlags e
+FULL OUTER JOIN
+    NewCustomerFlag n ON e.SessionID = n.SessionID;
+
+
+-- 9. POST-CONVERSION METRICS (FRAUD AND HOLDS)
+--------------------------------------------------------------------------------
+
+-- 9.1. Track Account Holds/Restrictions within 7 days of opening
+CREATE OR REPLACE TEMPORARY TABLE AccountHolds7Day AS
+SELECT
+    acct.SessionID,
+    MAX(CASE WHEN DATEDIFF(DAY, ctx.SessionStartTimestamp, hold.PLACED_DATE) <= 7 THEN 1 ELSE 0 END) AS HasSecurityHold7Day
+FROM
+    AccountLinkage acct
+INNER JOIN SessionContext ctx ON acct.SessionID = ctx.SessionID
+INNER JOIN
+    RISK_DATA.ACCOUNT_RESTRICTIONS hold
+    ON acct.ACCOUNT_ID_1 = hold.ACCOUNT_KEY
+WHERE
+    hold.RESTRICTION_CODE IN ('SECURITY01', 'FRAUD02', 'CUST_ACCESS_HOLD')
+GROUP BY 1;
+
+-- 9.2. Customer Risk Profile (Joining back to historical customer master)
+CREATE OR REPLACE TEMPORARY TABLE CustomerRiskProfile AS
+SELECT DISTINCT
+    ctx.SessionID,
+    -- Check if the user ID has historical flags for loss or charge-offs
+    CASE WHEN cust.HISTORICAL_LOSS_FLAG = 1 THEN 1 ELSE 0 END AS HasHistoricalLoss,
+    CASE WHEN cust.HISTORICAL_FRAUD_COUNT > 0 THEN 1 ELSE 0 END AS HasHistoricalFraud
+FROM
+    SessionContext ctx
+LEFT JOIN
+    CORE_FINANCE.CUSTOMER_MASTER_DIM cust
+    ON TRIM(ctx.UserIdentifierHash) = TRIM(cust.UNIQUE_CUSTOMER_ID_KEY)
+WHERE
+    ctx.UserIdentifierHash IS NOT NULL;
+
+
+-- 10. FINAL FUNNEL DATA COMBINATION
+--------------------------------------------------------------------------------
+
+-- Create the final structured view by joining all derived segments
+CREATE OR REPLACE VIEW FinalFunnelData AS
+SELECT
+    s.SessionID,
+    s.SessionStartTimestamp,
+    s.FunnelFlowType,
+    s.DeviceType,
+    p.FinalProductName,
+    p.FinalProductCode,
+    c.CustomerPathClassification,
+
+    -- Account and Application Status
+    l.APPLICATION_ID_1,
+    l.ACCOUNT_ID_1,
+    l.APPLICATION_ID_2,
+    l.ACCOUNT_ID_2,
+    CASE WHEN l.ACCOUNT_ID_1 IS NOT NULL THEN 1 ELSE 0 END AS Conversion_Success_Flag,
+
+    -- Customer Contact Details (Deduped)
+    e.LatestEmailAddress,
+    n.FirstName,
+    a.City,
+    a.PostalCode,
+
+    -- Risk and Security Metrics
+    r.HasHistoricalLoss,
+    r.HasHistoricalFraud,
+    COALESCE(h.HasSecurityHold7Day, 0) AS PostConversionHoldFlag
+
+FROM
+    SessionContext s
+LEFT JOIN InitialProductIntent p ON s.SessionID = p.SessionID
+LEFT JOIN CustomerPathAggregated c ON s.SessionID = c.SessionID
+LEFT JOIN AccountLinkage l ON s.SessionID = l.SessionID
+LEFT JOIN LatestEmail e ON s.SessionID = e.SessionID
+LEFT JOIN LatestName n ON s.SessionID = n.SessionID
+LEFT JOIN LatestAddress a ON s.SessionID = a.SessionID
+LEFT JOIN AccountHolds7Day h ON s.SessionID = h.SessionID
+LEFT JOIN CustomerRiskProfile r ON s.SessionID = r.SessionID;
